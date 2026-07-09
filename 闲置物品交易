@@ -1,0 +1,212 @@
+const express = require('express');
+const cors = require('cors');
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// 引入路由
+const authRoutes = require('./routes/auth');
+const communityRoutes = require('./routes/community');
+const goodsRoutes = require('./routes/goods');
+const chatRoutes = require('./routes/chat');
+const adminRoutes = require('./routes/admin');
+
+app.use('/api/auth', authRoutes);
+app.use('/api/community', communityRoutes);
+app.use('/api/goods', goodsRoutes);
+app.use('/api/chat', chatRoutes);
+app.use('/api/admin', adminRoutes);
+
+// 静态文件（可选）
+app.use(express.static('public'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
+const adapter = new FileSync('db.json');
+const db = low(adapter);
+
+// 初始化默认数据
+db.defaults({
+  users: [],
+  communities: [
+    { id: 1, name: '阳光花园', region: '天河区', address: '天河路100号', lat: 23.125, lng: 113.325 },
+    { id: 2, name: '翠湖山庄', region: '白云区', address: '白云大道北200号', lat: 23.168, lng: 113.282 },
+    { id: 3, name: '海珠半岛', region: '海珠区', address: '滨江东路500号', lat: 23.106, lng: 113.273 }
+  ],
+  categories: [
+    { id: 1, name: '手机数码' },
+    { id: 2, name: '电脑办公' },
+    { id: 3, name: '家用电器' },
+    { id: 4, name: '家居家具' },
+    { id: 5, name: '母婴玩具' },
+    { id: 6, name: '其他' }
+  ],
+  goods: [],
+  messages: [],
+  admins: [
+    { id: 1, username: 'admin', password: '123456', role: 'super' }  // 明文密码，仅测试用
+  ]
+}).write();
+
+module.exports = db;
+const express = require('express');
+const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
+const db = require('../db');
+
+// 模拟登录（生产环境请替换为微信登录）
+router.post('/mock-login', (req, res) => {
+  const { nickName } = req.body;
+  const openid = 'mock_' + Date.now();
+  const user = {
+    id: db.get('users').value().length + 1,
+    openid,
+    nick_name: nickName || '微信用户',
+    avatar_url: '',
+    phone: '',
+    real_name: '',
+    is_verified: false,
+    community_id: null
+  };
+  db.get('users').push(user).write();
+  // 简化 token（实际应使用 JWT）
+  const token = 'token_' + user.id;
+  res.json({ token, user });
+});
+
+// 绑定小区
+router.put('/bind-community', (req, res) => {
+  const { communityId } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  const userId = parseInt(token.replace('token_', ''));
+  db.get('users').find({ id: userId }).assign({ community_id: communityId }).write();
+  res.json({ success: true });
+});
+
+module.exports = router;
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+
+router.get('/list', (req, res) => {
+  const communities = db.get('communities').value();
+  res.json(communities);
+});
+
+module.exports = router;
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+
+// 获取商品列表（支持小区、分类筛选）
+router.get('/', (req, res) => {
+  let { communityId, categoryId, page = 1, pageSize = 20 } = req.query;
+  let goods = db.get('goods').filter({ status: 1 }).value();
+  if (communityId) goods = goods.filter(g => g.community_id == communityId);
+  if (categoryId) goods = goods.filter(g => g.category_id == categoryId);
+  const start = (page - 1) * pageSize;
+  const list = goods.slice(start, start + pageSize);
+  // 附带发布者信息
+  const enriched = list.map(g => {
+    const user = db.get('users').find({ id: g.user_id }).value() || {};
+    const community = db.get('communities').find({ id: g.community_id }).value() || {};
+    return { ...g, nick_name: user.nick_name, avatar_url: user.avatar_url, is_verified: user.is_verified, community_name: community.name };
+  });
+  res.json({ list: enriched, hasMore: start + pageSize < goods.length });
+});
+
+// 获取商品详情
+router.get('/:id', (req, res) => {
+  const goods = db.get('goods').find({ id: parseInt(req.params.id) }).value();
+  if (!goods) return res.status(404).json({ message: '商品不存在' });
+  const user = db.get('users').find({ id: goods.user_id }).value() || {};
+  const community = db.get('communities').find({ id: goods.community_id }).value() || {};
+  res.json({ ...goods, nick_name: user.nick_name, avatar_url: user.avatar_url, is_verified: user.is_verified, community_name: community.name });
+});
+
+// 发布商品（需登录）
+router.post('/', (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const userId = parseInt(token.replace('token_', ''));
+  const { title, categoryId, description, price, images, transactionType } = req.body;
+  if (!title || !categoryId) return res.status(400).json({ message: '标题和分类必填' });
+  const user = db.get('users').find({ id: userId }).value();
+  if (!user || !user.community_id) return res.status(400).json({ message: '请先绑定小区' });
+  
+  const newGoods = {
+    id: db.get('goods').value().length + 1,
+    title,
+    category_id: categoryId,
+    description,
+    price: parseFloat(price) || 0,
+    images: images || [],
+    video_url: '',
+    transaction_type: transactionType || '面交',
+    user_id: userId,
+    community_id: user.community_id,
+    status: 0, // 0待审核 1已上架
+    reject_reason: '',
+    view_count: 0,
+    created_at: new Date().toISOString()
+  };
+  db.get('goods').push(newGoods).write();
+  res.json({ success: true, message: '发布成功，等待审核' });
+});
+
+module.exports = router;
+// routes/chat.js
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+
+router.get('/history', (req, res) => {
+  const { withUserId } = req.query;
+  const token = req.headers.authorization?.split(' ')[1];
+  const userId = parseInt(token.replace('token_', ''));
+  const messages = db.get('messages').filter(m =>
+    (m.from_user_id === userId && m.to_user_id == withUserId) ||
+    (m.from_user_id == withUserId && m.to_user_id === userId)
+  ).value();
+  res.json(messages);
+});
+
+router.post('/send', (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  const fromUserId = parseInt(token.replace('token_', ''));
+  const { toUserId, content, goodsId } = req.body;
+  db.get('messages').push({
+    id: Date.now(),
+    from_user_id: fromUserId,
+    to_user_id: toUserId,
+    goods_id: goodsId || null,
+    content,
+    type: 'text',
+    created_at: new Date().toISOString()
+  }).write();
+  res.json({ success: true });
+});
+
+module.exports = router;
+// routes/admin.js
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+
+router.get('/goods/pending', (req, res) => {
+  const goods = db.get('goods').filter({ status: 0 }).value();
+  const enriched = goods.map(g => {
+    const user = db.get('users').find({ id: g.user_id }).value() || {};
+    return { ...g, nick_name: user.nick_name };
+  });
+  res.json(enriched);
+});
+
+router.put('/goods/:id/audit', (req, res) => {
+  const { status, rejectReason } = req.body;
+  db.get('goods').find({ id: parseInt(req.params.id) }).assign({ status, reject_reason: rejectReason || '' }).write();
+  res.json({ success: true });
+});
+
+module.exports = router;
